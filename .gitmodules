@@ -1,0 +1,6 @@
+[submodule "back"]
+	path = back
+	url = git@github.com:Alnoir-0011/algo_sangaku_back.git
+[submodule "front"]
+	path = front
+	url = git@github.com:Alnoir-0011/algo_sangaku_front.git
