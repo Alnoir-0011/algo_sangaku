@@ -36,6 +36,17 @@ bundle exec rspec spec/requests/            # API リクエストテストのみ
 bundle exec rspec spec/path/to/file_spec.rb # 単一ファイル
 ```
 
+### OpenAPI ドキュメントの更新
+
+OpenAPI ドキュメント（`doc/openapi/`）は **`OPENAPI=1` を付けてテストを実行することで自動生成する**。手動編集は禁止。
+
+```bash
+docker-compose exec -e OPENAPI=1 web bundle exec rspec spec/requests/api/v1/admin/users_spec.rb
+```
+
+- ドキュメントにパラメータを追加したい場合は、そのパラメータを使う **動作確認テスト**（`openapi: false` なし）を用意することで反映する
+- **OpenAPI ドキュメント更新のためだけのテストを作ることは禁止**。テストは必ず動作の仕様を表すものとして書く
+
 ### カバレッジ要件
 
 - 新規コード: 80%以上（行カバレッジ）
