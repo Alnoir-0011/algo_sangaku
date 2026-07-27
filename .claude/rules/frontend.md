@@ -39,13 +39,13 @@ pnpm show-report      # Playwright HTML レポートを表示
 pnpm test:e2e                                          # 全E2Eテスト（全ブラウザ）
 
 # オプション指定（-- を付けてPlaywright CLIに渡す）
-pnpm test:e2e -- --project=chromium                    # Chromiumのみ
-pnpm test:e2e -- --headed                              # ブラウザUIを表示して実行
-pnpm test:e2e -- --debug                               # Playwright Inspector でデバッグ
-pnpm test:e2e -- -g "テスト名のキーワード"              # テスト名フィルタ（正規表現可）
-pnpm test:e2e -- tests/e2e/path/to/file.spec.ts        # 特定ファイルのみ
-pnpm test:e2e -- --workers=1                           # シリアル実行（CI相当）
-pnpm test:e2e -- --reporter=list                       # コンソール出力形式を変更
+pnpm test:e2e --project=chromium                    # Chromiumのみ
+pnpm test:e2e --headed                              # ブラウザUIを表示して実行
+pnpm test:e2e --debug                               # Playwright Inspector でデバッグ
+pnpm test:e2e -g "テスト名のキーワード"              # テスト名フィルタ（正規表現可）
+pnpm test:e2e tests/e2e/path/to/file.spec.ts        # 特定ファイルのみ
+pnpm test:e2e --workers=1                           # シリアル実行（CI相当）
+pnpm test:e2e --reporter=list                       # コンソール出力形式を変更
 
 pnpm show-report                                       # HTML レポートをブラウザで確認
 ```
@@ -64,11 +64,11 @@ pnpm show-report                                       # HTML レポートをブ
 pnpm test:components                                   # 全コンポーネントテスト
 
 # オプション指定
-pnpm test:components -- --headed                       # ブラウザUIを表示
-pnpm test:components -- --debug                        # デバッグモード
-pnpm test:components -- --project=chromium             # Chromiumのみ
-pnpm test:components -- -g "コンポーネント名"           # テスト名フィルタ
-pnpm test:components -- tests/components/path/to/file.spec.tsx  # 特定ファイルのみ
+pnpm test:components --headed                       # ブラウザUIを表示
+pnpm test:components --debug                        # デバッグモード
+pnpm test:components --project=chromium             # Chromiumのみ
+pnpm test:components -g "コンポーネント名"           # テスト名フィルタ
+pnpm test:components tests/components/path/to/file.spec.tsx  # 特定ファイルのみ
 ```
 
 ### アーキテクチャ
