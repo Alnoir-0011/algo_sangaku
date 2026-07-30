@@ -1,0 +1,88 @@
+name: Deploy Sync
+
+# main への push（PRマージ）を検知し、変更のあった submodule（back/front）
+# だけを対象に、各リポジトリの workflow_dispatch(sha) をリモート起動する。
+# 実デプロイの完了・承認は待たない（fire-and-forget）。
+# 起動後の承認・進捗確認は各リポジトリの Actions 画面で手動確認すること。
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # push.before/after 間で back/front の gitlink（submoduleポインタ）に
+      # 変更があったかどうかを検知する。ブランチ新規作成直後などで before が
+      # 全ゼロSHAになるケースでは、履歴比較ができないため両方とも対象とする。
+      - name: Detect changed submodules
+        id: detect
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+        run: |
+          if [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            echo "back=true" >> "$GITHUB_OUTPUT"
+            echo "front=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CHANGED=$(git diff --name-only "$BEFORE" "$AFTER" -- back front)
+
+          if echo "$CHANGED" | grep -qx "back"; then
+            echo "back=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "back=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if echo "$CHANGED" | grep -qx "front"; then
+            echo "front=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "front=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Get pinned SHAs
+        id: sha
+        if: steps.detect.outputs.back == 'true' || steps.detect.outputs.front == 'true'
+        run: |
+          echo "back=$(git rev-parse HEAD:back)" >> "$GITHUB_OUTPUT"
+          echo "front=$(git rev-parse HEAD:front)" >> "$GITHUB_OUTPUT"
+
+      # DEPLOY_DISPATCH_TOKEN は back/front 双方への Actions:write 権限を持つ
+      # fine-grained PAT。GITHUB_TOKEN では他リポジトリを dispatch できないため必須。
+      - name: Dispatch back deploy
+        if: steps.detect.outputs.back == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.DEPLOY_DISPATCH_TOKEN }}
+          SHA: ${{ steps.sha.outputs.back }}
+        run: |
+          gh workflow run autodeploy.yml \
+            --repo Alnoir-0011/algo_sangaku_back \
+            --ref main \
+            -f sha="$SHA"
+          echo "::notice title=back deploy dispatched::sha=$SHA - 承認・進捗は https://github.com/Alnoir-0011/algo_sangaku_back/actions から確認してください"
+
+      - name: Dispatch front deploy
+        if: steps.detect.outputs.front == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.DEPLOY_DISPATCH_TOKEN }}
+          SHA: ${{ steps.sha.outputs.front }}
+        run: |
+          gh workflow run deploy.yml \
+            --repo Alnoir-0011/algo_sangaku_front \
+            --ref main \
+            -f sha="$SHA"
+          echo "::notice title=front deploy dispatched::sha=$SHA - 承認・進捗は https://github.com/Alnoir-0011/algo_sangaku_front/actions から確認してください"
+
+      - name: No submodule changes
+        if: steps.detect.outputs.back == 'false' && steps.detect.outputs.front == 'false'
+        run: echo "back/front の submodule ポインタ変更がないため、デプロイはスキップします。"
