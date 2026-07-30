@@ -12,77 +12,116 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: deploy-sync
+  cancel-in-progress: false
+
 jobs:
-  dispatch:
+  # 変更検知のみを行うジョブ。DEPLOY_DISPATCH_TOKEN は扱わない。
+  detect:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      back: ${{ steps.detect.outputs.back }}
+      front: ${{ steps.detect.outputs.front }}
+      back_sha: ${{ steps.detect.outputs.back_sha }}
+      front_sha: ${{ steps.detect.outputs.front_sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       # push.before/after 間で back/front の gitlink（submoduleポインタ）に
-      # 変更があったかどうかを検知する。ブランチ新規作成直後などで before が
-      # 全ゼロSHAになるケースでは、履歴比較ができないため両方とも対象とする。
+      # 変更があったかどうかを検知する。ブランチ新規作成直後などで before の
+      # コミットが存在しない場合は、履歴比較ができないため両方とも対象とする。
+      # 後退（ロールバック以外での意図しないダウングレード）は GitHub の
+      # compare API で検知し、fail-closed で止める。
       - name: Detect changed submodules
         id: detect
         env:
+          GH_TOKEN: ${{ github.token }}
           BEFORE: ${{ github.event.before }}
-          AFTER: ${{ github.event.after }}
         run: |
-          if [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
-            echo "back=true" >> "$GITHUB_OUTPUT"
-            echo "front=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          set -euo pipefail
 
-          CHANGED=$(git diff --name-only "$BEFORE" "$AFTER" -- back front)
+          detect_one() {
+            local name="$1" repo="$2" new old status
 
-          if echo "$CHANGED" | grep -qx "back"; then
-            echo "back=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "back=false" >> "$GITHUB_OUTPUT"
-          fi
+            new=$(git rev-parse "HEAD:$name")
+            if ! printf '%s' "$new" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::invalid gitlink sha for $name" >&2
+              exit 1
+            fi
 
-          if echo "$CHANGED" | grep -qx "front"; then
-            echo "front=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "front=false" >> "$GITHUB_OUTPUT"
-          fi
+            old=""
+            if git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+              old=$(git rev-parse "${BEFORE}:${name}" 2>/dev/null || echo "")
+            fi
 
-      - name: Get pinned SHAs
-        id: sha
-        if: steps.detect.outputs.back == 'true' || steps.detect.outputs.front == 'true'
-        run: |
-          echo "back=$(git rev-parse HEAD:back)" >> "$GITHUB_OUTPUT"
-          echo "front=$(git rev-parse HEAD:front)" >> "$GITHUB_OUTPUT"
+            if [ "$old" = "$new" ]; then
+              echo "${name}=false" >> "$GITHUB_OUTPUT"
+              echo "${name}_sha=$new" >> "$GITHUB_OUTPUT"
+              return
+            fi
 
-      # DEPLOY_DISPATCH_TOKEN は back/front 双方への Actions:write 権限を持つ
-      # fine-grained PAT。GITHUB_TOKEN では他リポジトリを dispatch できないため必須。
+            if [ -n "$old" ]; then
+              status=$(gh api "repos/${repo}/compare/${old}...${new}" --jq '.status')
+              if [ "$status" = "behind" ]; then
+                echo "::error::${name} pointer moved backwards (${old} -> ${new}). 意図したロールバックの場合は doc/release.md の手順に従ってください" >&2
+                exit 1
+              fi
+            fi
+
+            echo "${name}=true" >> "$GITHUB_OUTPUT"
+            echo "${name}_sha=$new" >> "$GITHUB_OUTPUT"
+          }
+
+          detect_one back  Alnoir-0011/algo_sangaku_back
+          detect_one front Alnoir-0011/algo_sangaku_front
+
+      - name: No submodule changes
+        if: steps.detect.outputs.back == 'false' && steps.detect.outputs.front == 'false'
+        run: echo "back/front の submodule ポインタ変更がないため、デプロイはスキップします。"
+
+  # DEPLOY_DISPATCH_TOKEN を扱うジョブ。checkout は行わない。
+  # back/front を独立したジョブにすることで、片方の dispatch 失敗が
+  # もう片方をブロックしない（GitHub Actions の if は既定で暗黙に
+  # success() が付くため、同一ジョブ内の後続ステップにすると
+  # 前段の失敗で後段がスキップされてしまう）。
+  dispatch-back:
+    needs: detect
+    if: needs.detect.outputs.back == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
       - name: Dispatch back deploy
-        if: steps.detect.outputs.back == 'true'
         env:
           GH_TOKEN: ${{ secrets.DEPLOY_DISPATCH_TOKEN }}
-          SHA: ${{ steps.sha.outputs.back }}
+          SHA: ${{ needs.detect.outputs.back_sha }}
         run: |
+          set -euo pipefail
           gh workflow run autodeploy.yml \
             --repo Alnoir-0011/algo_sangaku_back \
             --ref main \
             -f sha="$SHA"
           echo "::notice title=back deploy dispatched::sha=$SHA - 承認・進捗は https://github.com/Alnoir-0011/algo_sangaku_back/actions から確認してください"
 
+  dispatch-front:
+    needs: detect
+    if: needs.detect.outputs.front == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
       - name: Dispatch front deploy
-        if: steps.detect.outputs.front == 'true'
         env:
           GH_TOKEN: ${{ secrets.DEPLOY_DISPATCH_TOKEN }}
-          SHA: ${{ steps.sha.outputs.front }}
+          SHA: ${{ needs.detect.outputs.front_sha }}
         run: |
+          set -euo pipefail
           gh workflow run deploy.yml \
             --repo Alnoir-0011/algo_sangaku_front \
             --ref main \
             -f sha="$SHA"
           echo "::notice title=front deploy dispatched::sha=$SHA - 承認・進捗は https://github.com/Alnoir-0011/algo_sangaku_front/actions から確認してください"
-
-      - name: No submodule changes
-        if: steps.detect.outputs.back == 'false' && steps.detect.outputs.front == 'false'
-        run: echo "back/front の submodule ポインタ変更がないため、デプロイはスキップします。"
