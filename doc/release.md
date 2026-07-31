@@ -22,7 +22,7 @@ front/back それぞれで通常通り開発・レビュー・マージ（各リ
 
 ## 前提条件
 
-- 親リポジトリの Secrets に `DEPLOY_DISPATCH_TOKEN`（back/front 双方への `workflow_dispatch` を起動できる fine-grained PAT）が登録済みであること
+- 親リポジトリの Environment `deploy-dispatch`（Deployment branch policy: `main` 限定）に、Secrets `DEPLOY_DISPATCH_TOKEN`（back/front 双方への `workflow_dispatch` を起動できる fine-grained PAT）が登録済みであること。repository secret ではなく environment secret にすることで、`main` 以外のブランチのワークフローから読めないようにしている
 - back/front それぞれの GitHub Environment（back: `production` / front: `Production`）に Required reviewer と Deployment branch policy（`main` 限定）が設定されており、承認できるメンバーであること
 - back の Environment に ECS/ECR 関連 secrets（`AWS_OIDC_ROLE_ARN`、`ECR_RAILS_URL`、`ECR_NGINX_URL`、`ECS_CLUSTER_NAME`、`ECS_SERVICE_NAME`、`ECS_TASK_FAMILY` 等）が登録済みであること
 - front の Environment に `VERCEL_ORG_ID` / `VERCEL_PROJECT_ID` / `VERCEL_TOKEN` が登録済みであること（未登録だと dispatch 自体は成功するが front 側のジョブが必ず失敗する）
