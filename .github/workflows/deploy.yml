@@ -12,8 +12,19 @@ on:
 permissions:
   contents: read
 
+# コミット単位でグループ化する（直列化しない）。
+# 固定 group 名で直列化する設計だと、実行中の run がある間に2件連続で
+# push された場合、先に pending になった run が無条件にキャンセルされ
+# 最新のみが残る。このワークフローは push.before/after の差分で変更検知
+# するため、キャンセルされた run が検知するはずだったポインタ変更は
+# 後続 run の差分にも現れず、永久に検知されない（リリースの取りこぼしが
+# 無言で発生する）。
+# group をコミット単位にすることで別コミットの run が互いをキャンセル
+# しなくなる。これにより同時に複数の dispatch が飛びうるが、back/front
+# 側は Required reviewer の承認ゲートがあるため、古い SHA の dispatch は
+# 承認画面で可視化され、人間が判断できる。
 concurrency:
-  group: deploy-sync
+  group: deploy-sync-${{ github.sha }}
   cancel-in-progress: false
 
 jobs:
@@ -21,6 +32,8 @@ jobs:
   detect:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
     outputs:
       back: ${{ steps.detect.outputs.back }}
       front: ${{ steps.detect.outputs.front }}
@@ -36,18 +49,54 @@ jobs:
       # push.before/after 間で back/front の gitlink（submoduleポインタ）に
       # 変更があったかどうかを検知する。ブランチ新規作成直後などで before の
       # コミットが存在しない場合は、履歴比較ができないため両方とも対象とする。
-      # 後退（ロールバック以外での意図しないダウングレード）は GitHub の
-      # compare API で検知し、fail-closed で止める。
+      #
+      # ポインタに変更があった場合、以下の2段階で検証する（fail-closed）。
+      #   1. main 到達可能性検証: new が対象リポジトリの main に到達可能
+      #      （main...new が identical/behind）でなければ止める。fork 由来
+      #      の未マージコミットが gitlink に紛れ込むケースを防ぐ。
+      #   2. 後退・分岐検証: old...new が behind/diverged（後退 or 分岐）
+      #      の場合、push された commit 範囲に [rollback] マーカーがなけ
+      #      れば止める。意図的なロールバックは commit メッセージに
+      #      [rollback] を含めることで許可できる。
       - name: Detect changed submodules
         id: detect
         env:
+          # GITHUB_TOKEN は本来 workflow を実行しているリポジトリ自身にしか
+          # スコープを持たないが、algo_sangaku_back / algo_sangaku_front は
+          # public リポジトリのため compare API の read アクセスが通っている。
+          # 将来これらを private 化した場合、このトークンでは compare API が
+          # 404 になり以下の検証が機能しなくなる点に注意（その場合は PAT へ
+          # の切り替えが必要）。
           GH_TOKEN: ${{ github.token }}
           BEFORE: ${{ github.event.before }}
         run: |
           set -euo pipefail
 
+          # ロールバック許可判定。push された commit 範囲
+          # （BEFORE..GITHUB_SHA。GITHUB_SHA は Actions が既定で設定する環境
+          # 変数で、push イベントでは github.sha と同値）のコミットメッセー
+          # ジ群に、リテラル文字列 "[rollback]"（大小文字区別なし）が含まれ
+          # るかどうかを事前に判定する。マージコミット・squash マージ・
+          # rebase いずれの場合でも、ブランチ側のコミットにマーカーがあれば
+          # 検出できる。BEFORE のコミットが存在しない場合は判定できないため
+          # false とする。
+          # NOTE: ここでパイプ（git log | grep -q）を使ってはならない。grep -q は
+          # 最初のマッチで即終了するため git log が SIGPIPE で 141 終了し、
+          # set -o pipefail 下では「マッチしたのにパイプライン全体が失敗」と
+          # なる（実測で再現済み）。コミット範囲が小さいと git log が書き切る
+          # ので成功してしまい、範囲が大きいときだけ落ちる = 障害対応中の
+          # ロールバックが無言で拒否される。変数に受けてから here-string で
+          # 判定することでパイプを排除する。
+          ROLLBACK_ALLOWED=false
+          if git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            PUSHED_MESSAGES=$(git log --format=%B "${BEFORE}..${GITHUB_SHA}")
+            if grep -qiF '[rollback]' <<<"$PUSHED_MESSAGES"; then
+              ROLLBACK_ALLOWED=true
+            fi
+          fi
+
           detect_one() {
-            local name="$1" repo="$2" new old status
+            local name="$1" repo="$2" new old status main_status
 
             new=$(git rev-parse "HEAD:$name")
             if ! printf '%s' "$new" | grep -Eq '^[0-9a-f]{40}$'; then
@@ -66,12 +115,42 @@ jobs:
               return
             fi
 
-            if [ -n "$old" ]; then
-              status=$(gh api "repos/${repo}/compare/${old}...${new}" --jq '.status')
-              if [ "$status" = "behind" ]; then
-                echo "::error::${name} pointer moved backwards (${old} -> ${new}). 意図したロールバックの場合は doc/release.md の手順に従ってください" >&2
+            # main 到達可能性検証（fail-closed）。back/front は public リポ
+            # ジトリのため、fork 由来の未マージコミットの SHA を gitlink に
+            # 記録すると old...new の compare だけでは ahead 判定になりすり
+            # 抜けてしまう。main...new が identical（new が main の先端）ま
+            # たは behind（new が main の祖先）であれば「main に到達可能」
+            # とみなす。back/front 側にも merge-base --is-ancestor による検
+            # 証はあるが、親リポ側でも早期に止める。ロールバック時も
+            # main...new は behind になるため、この検証はロールバックを阻害
+            # しない。
+            main_status=$(gh api "repos/${repo}/compare/main...${new}" --jq '.status') || {
+              echo "::error::gh api call failed: repos/${repo}/compare/main...${new}" >&2
+              exit 1
+            }
+            case "$main_status" in
+              identical|behind) ;;
+              *)
+                echo "::error::${name} new sha (${new}) is not reachable from ${repo}#main (main...new status=${main_status})" >&2
                 exit 1
-              fi
+                ;;
+            esac
+
+            if [ -n "$old" ]; then
+              status=$(gh api "repos/${repo}/compare/${old}...${new}" --jq '.status') || {
+                echo "::error::gh api call failed: repos/${repo}/compare/${old}...${new}" >&2
+                exit 1
+              }
+              case "$status" in
+                behind|diverged)
+                  if [ "$ROLLBACK_ALLOWED" = "true" ]; then
+                    echo "::warning::${name} pointer moved backwards or diverged (${old} -> ${new}, status=${status})。commit メッセージに [rollback] が含まれているため、ロールバックとして続行します" >&2
+                  else
+                    echo "::error::${name} pointer moved backwards or diverged (${old} -> ${new}, status=${status})。意図したロールバックの場合はコミットメッセージに [rollback] を含めて再度 PR を作成してください。詳細は doc/release.md を参照してください" >&2
+                    exit 1
+                  fi
+                  ;;
+              esac
             fi
 
             echo "${name}=true" >> "$GITHUB_OUTPUT"
@@ -96,6 +175,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: deploy-dispatch
+    # checkout を行わず GITHUB_TOKEN も使わない（PAT のみ使用）ため、
+    # workflow レベルの contents: read を継承しないようにする。
+    permissions: {}
     steps:
       - name: Dispatch back deploy
         env:
@@ -115,6 +197,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: deploy-dispatch
+    # checkout を行わず GITHUB_TOKEN も使わない（PAT のみ使用）ため、
+    # workflow レベルの contents: read を継承しないようにする。
+    permissions: {}
     steps:
       - name: Dispatch front deploy
         env:
