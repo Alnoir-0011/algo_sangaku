@@ -1,0 +1,220 @@
+name: Deploy Sync
+
+# main への push（PRマージ）を検知し、変更のあった submodule（back/front）
+# だけを対象に、各リポジトリの workflow_dispatch(sha) をリモート起動する。
+# 実デプロイの完了・承認は待たない（fire-and-forget）。
+# 起動後の承認・進捗確認は各リポジトリの Actions 画面で手動確認すること。
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# コミット単位でグループ化する（直列化しない）。
+# 固定 group 名で直列化する設計だと、実行中の run がある間に2件連続で
+# push された場合、先に pending になった run が無条件にキャンセルされ
+# 最新のみが残る。このワークフローは push.before/after の差分で変更検知
+# するため、キャンセルされた run が検知するはずだったポインタ変更は
+# 後続 run の差分にも現れず、永久に検知されない（リリースの取りこぼしが
+# 無言で発生する）。
+# group をコミット単位にすることで別コミットの run が互いをキャンセル
+# しなくなる。これにより同時に複数の dispatch が飛びうるが、back/front
+# 側は Required reviewer の承認ゲートがあるため、古い SHA の dispatch は
+# 承認画面で可視化され、人間が判断できる。
+concurrency:
+  group: deploy-sync-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  # 変更検知のみを行うジョブ。DEPLOY_DISPATCH_TOKEN は扱わない。
+  detect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      back: ${{ steps.detect.outputs.back }}
+      front: ${{ steps.detect.outputs.front }}
+      back_sha: ${{ steps.detect.outputs.back_sha }}
+      front_sha: ${{ steps.detect.outputs.front_sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # push.before/after 間で back/front の gitlink（submoduleポインタ）に
+      # 変更があったかどうかを検知する。ブランチ新規作成直後などで before の
+      # コミットが存在しない場合は、履歴比較ができないため両方とも対象とする。
+      #
+      # ポインタに変更があった場合、以下の2段階で検証する（fail-closed）。
+      #   1. main 到達可能性検証: new が対象リポジトリの main に到達可能
+      #      （main...new が identical/behind）でなければ止める。fork 由来
+      #      の未マージコミットが gitlink に紛れ込むケースを防ぐ。
+      #   2. 後退・分岐検証: old...new が behind/diverged（後退 or 分岐）
+      #      の場合、push された commit 範囲に [rollback] マーカーがなけ
+      #      れば止める。意図的なロールバックは commit メッセージに
+      #      [rollback] を含めることで許可できる。
+      - name: Detect changed submodules
+        id: detect
+        env:
+          # GITHUB_TOKEN は本来 workflow を実行しているリポジトリ自身にしか
+          # スコープを持たないが、algo_sangaku_back / algo_sangaku_front は
+          # public リポジトリのため compare API の read アクセスが通っている。
+          # 将来これらを private 化した場合、このトークンでは compare API が
+          # 404 になり以下の検証が機能しなくなる点に注意（その場合は PAT へ
+          # の切り替えが必要）。
+          GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          # NOTE: ::error:: / ::warning:: などのワークフローコマンドは stdout に出力する
+          # （リダイレクトを付けない）。GitHub のドキュメントは stdout を前提としており、
+          # stderr 経由でアノテーションとして認識されるかは保証されていないため。
+          # 後続の dispatch ジョブの ::notice も同様に stdout に出している。
+
+          # ロールバック許可判定。push された commit 範囲
+          # （BEFORE..GITHUB_SHA。GITHUB_SHA は Actions が既定で設定する環境
+          # 変数で、push イベントでは github.sha と同値）のコミットメッセー
+          # ジ群に、リテラル文字列 "[rollback]"（大小文字区別なし）が含まれ
+          # るかどうかを事前に判定する。マージコミット・squash マージ・
+          # rebase いずれの場合でも、ブランチ側のコミットにマーカーがあれば
+          # 検出できる。BEFORE のコミットが存在しない場合は判定できないため
+          # false とする。
+          # NOTE: ここでパイプ（git log | grep -q）を使ってはならない。grep -q は
+          # 最初のマッチで即終了するため git log が SIGPIPE で 141 終了し、
+          # set -o pipefail 下では「マッチしたのにパイプライン全体が失敗」と
+          # なる（実測で再現済み）。コミット範囲が小さいと git log が書き切る
+          # ので成功してしまい、範囲が大きいときだけ落ちる = 障害対応中の
+          # ロールバックが無言で拒否される。変数に受けてから here-string で
+          # 判定することでパイプを排除する。
+          ROLLBACK_ALLOWED=false
+          if git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            PUSHED_MESSAGES=$(git log --format=%B "${BEFORE}..${GITHUB_SHA}")
+            if grep -qiF '[rollback]' <<<"$PUSHED_MESSAGES"; then
+              ROLLBACK_ALLOWED=true
+            fi
+          fi
+
+          detect_one() {
+            local name="$1" repo="$2" new old status main_status
+
+            new=$(git rev-parse "HEAD:$name")
+            # 上記の ROLLBACK_ALLOWED 判定と同じ理由でパイプを使わない（here-string で渡す）
+            if ! grep -Eq '^[0-9a-f]{40}$' <<<"$new"; then
+              echo "::error::invalid gitlink sha for $name"
+              exit 1
+            fi
+
+            old=""
+            if git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+              old=$(git rev-parse "${BEFORE}:${name}" 2>/dev/null || echo "")
+            fi
+
+            if [ "$old" = "$new" ]; then
+              echo "${name}=false" >> "$GITHUB_OUTPUT"
+              echo "${name}_sha=$new" >> "$GITHUB_OUTPUT"
+              return
+            fi
+
+            # main 到達可能性検証（fail-closed）。back/front は public リポ
+            # ジトリのため、fork 由来の未マージコミットの SHA を gitlink に
+            # 記録すると old...new の compare だけでは ahead 判定になりすり
+            # 抜けてしまう。main...new が identical（new が main の先端）ま
+            # たは behind（new が main の祖先）であれば「main に到達可能」
+            # とみなす。back/front 側にも merge-base --is-ancestor による検
+            # 証はあるが、親リポ側でも早期に止める。ロールバック時も
+            # main...new は behind になるため、この検証はロールバックを阻害
+            # しない。
+            main_status=$(gh api "repos/${repo}/compare/main...${new}" --jq '.status') || {
+              echo "::error::gh api call failed: repos/${repo}/compare/main...${new}"
+              exit 1
+            }
+            case "$main_status" in
+              identical|behind) ;;
+              *)
+                echo "::error::${name} new sha (${new}) is not reachable from ${repo}#main (main...new status=${main_status})"
+                exit 1
+                ;;
+            esac
+
+            if [ -n "$old" ]; then
+              status=$(gh api "repos/${repo}/compare/${old}...${new}" --jq '.status') || {
+                echo "::error::gh api call failed: repos/${repo}/compare/${old}...${new}"
+                exit 1
+              }
+              case "$status" in
+                behind|diverged)
+                  if [ "$ROLLBACK_ALLOWED" = "true" ]; then
+                    echo "::warning::${name} pointer moved backwards or diverged (${old} -> ${new}, status=${status})。commit メッセージに [rollback] が含まれているため、ロールバックとして続行します"
+                  else
+                    echo "::error::${name} pointer moved backwards or diverged (${old} -> ${new}, status=${status})。意図したロールバックの場合はコミットメッセージに [rollback] を含めて再度 PR を作成してください。詳細は doc/release.md を参照してください"
+                    exit 1
+                  fi
+                  ;;
+              esac
+            fi
+
+            echo "${name}=true" >> "$GITHUB_OUTPUT"
+            echo "${name}_sha=$new" >> "$GITHUB_OUTPUT"
+          }
+
+          detect_one back  Alnoir-0011/algo_sangaku_back
+          detect_one front Alnoir-0011/algo_sangaku_front
+
+      - name: No submodule changes
+        if: steps.detect.outputs.back == 'false' && steps.detect.outputs.front == 'false'
+        run: echo "back/front の submodule ポインタ変更がないため、デプロイはスキップします。"
+
+  # DEPLOY_DISPATCH_TOKEN を扱うジョブ。checkout は行わない。
+  # back/front を独立したジョブにすることで、片方の dispatch 失敗が
+  # もう片方をブロックしない（GitHub Actions の if は既定で暗黙に
+  # success() が付くため、同一ジョブ内の後続ステップにすると
+  # 前段の失敗で後段がスキップされてしまう）。
+  dispatch-back:
+    needs: detect
+    if: needs.detect.outputs.back == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: deploy-dispatch
+    # checkout を行わず GITHUB_TOKEN も使わない（PAT のみ使用）ため、
+    # workflow レベルの contents: read を継承しないようにする。
+    permissions: {}
+    steps:
+      - name: Dispatch back deploy
+        env:
+          GH_TOKEN: ${{ secrets.DEPLOY_DISPATCH_TOKEN }}
+          SHA: ${{ needs.detect.outputs.back_sha }}
+        run: |
+          set -euo pipefail
+          gh workflow run autodeploy.yml \
+            --repo Alnoir-0011/algo_sangaku_back \
+            --ref main \
+            -f sha="$SHA"
+          echo "::notice title=back deploy dispatched::sha=$SHA - 承認・進捗は https://github.com/Alnoir-0011/algo_sangaku_back/actions から確認してください"
+
+  dispatch-front:
+    needs: detect
+    if: needs.detect.outputs.front == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: deploy-dispatch
+    # checkout を行わず GITHUB_TOKEN も使わない（PAT のみ使用）ため、
+    # workflow レベルの contents: read を継承しないようにする。
+    permissions: {}
+    steps:
+      - name: Dispatch front deploy
+        env:
+          GH_TOKEN: ${{ secrets.DEPLOY_DISPATCH_TOKEN }}
+          SHA: ${{ needs.detect.outputs.front_sha }}
+        run: |
+          set -euo pipefail
+          gh workflow run deploy.yml \
+            --repo Alnoir-0011/algo_sangaku_front \
+            --ref main \
+            -f sha="$SHA"
+          echo "::notice title=front deploy dispatched::sha=$SHA - 承認・進捗は https://github.com/Alnoir-0011/algo_sangaku_front/actions から確認してください"
