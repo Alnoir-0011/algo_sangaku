@@ -1,6 +1,6 @@
 ## Git ブランチ運用ルール
 
-`front/` と `back/` はそれぞれ独立したサブモジュールリポジトリ。**変更は必ず各サブモジュール内でブランチを切ってから行う。親リポジトリではブランチを切らない。**
+`front/` と `back/` はそれぞれ独立したサブモジュールリポジトリ。**front/back のコードを変更する場合は、必ず各サブモジュール内でブランチを切ってから行う。親リポジトリでブランチを切って front/back のコードを変更してはいけない。**
 
 ```bash
 # front を変更する場合
@@ -9,6 +9,15 @@ cd front && git checkout -b <branch-name>
 # back を変更する場合
 cd back && git checkout -b <branch-name>
 ```
+
+**ただし、親リポジトリ自身のファイルを変更する場合は親リポジトリでブランチを切る。** 対象は `.github/`・`doc/`・`.claude/`・`CLAUDE.md` などのファイルと、submodule ポインタ（gitlink）の更新。ポインタ更新の具体的な手順は `doc/release.md` を参照する。
+
+```bash
+# 親リポ自身の変更（deploy.yml の修正、submodule ポインタ更新など）
+cd <親リポ> && git checkout -b <branch-name>
+```
+
+いずれの場合も、`git checkout -b` の直前に `pwd` で作業ディレクトリを確認すること。永続シェルの cwd がずれたまま意図しないリポジトリにブランチを作る事故が起きやすい。
 
 ### git / gh コマンド実行前のブランチ確認
 

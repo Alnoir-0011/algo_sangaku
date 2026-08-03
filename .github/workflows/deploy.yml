@@ -72,6 +72,11 @@ jobs:
         run: |
           set -euo pipefail
 
+          # NOTE: ::error:: / ::warning:: などのワークフローコマンドは stdout に出力する
+          # （リダイレクトを付けない）。GitHub のドキュメントは stdout を前提としており、
+          # stderr 経由でアノテーションとして認識されるかは保証されていないため。
+          # 後続の dispatch ジョブの ::notice も同様に stdout に出している。
+
           # ロールバック許可判定。push された commit 範囲
           # （BEFORE..GITHUB_SHA。GITHUB_SHA は Actions が既定で設定する環境
           # 変数で、push イベントでは github.sha と同値）のコミットメッセー
@@ -99,8 +104,9 @@ jobs:
             local name="$1" repo="$2" new old status main_status
 
             new=$(git rev-parse "HEAD:$name")
-            if ! printf '%s' "$new" | grep -Eq '^[0-9a-f]{40}$'; then
-              echo "::error::invalid gitlink sha for $name" >&2
+            # 上記の ROLLBACK_ALLOWED 判定と同じ理由でパイプを使わない（here-string で渡す）
+            if ! grep -Eq '^[0-9a-f]{40}$' <<<"$new"; then
+              echo "::error::invalid gitlink sha for $name"
               exit 1
             fi
 
@@ -125,28 +131,28 @@ jobs:
             # main...new は behind になるため、この検証はロールバックを阻害
             # しない。
             main_status=$(gh api "repos/${repo}/compare/main...${new}" --jq '.status') || {
-              echo "::error::gh api call failed: repos/${repo}/compare/main...${new}" >&2
+              echo "::error::gh api call failed: repos/${repo}/compare/main...${new}"
               exit 1
             }
             case "$main_status" in
               identical|behind) ;;
               *)
-                echo "::error::${name} new sha (${new}) is not reachable from ${repo}#main (main...new status=${main_status})" >&2
+                echo "::error::${name} new sha (${new}) is not reachable from ${repo}#main (main...new status=${main_status})"
                 exit 1
                 ;;
             esac
 
             if [ -n "$old" ]; then
               status=$(gh api "repos/${repo}/compare/${old}...${new}" --jq '.status') || {
-                echo "::error::gh api call failed: repos/${repo}/compare/${old}...${new}" >&2
+                echo "::error::gh api call failed: repos/${repo}/compare/${old}...${new}"
                 exit 1
               }
               case "$status" in
                 behind|diverged)
                   if [ "$ROLLBACK_ALLOWED" = "true" ]; then
-                    echo "::warning::${name} pointer moved backwards or diverged (${old} -> ${new}, status=${status})。commit メッセージに [rollback] が含まれているため、ロールバックとして続行します" >&2
+                    echo "::warning::${name} pointer moved backwards or diverged (${old} -> ${new}, status=${status})。commit メッセージに [rollback] が含まれているため、ロールバックとして続行します"
                   else
-                    echo "::error::${name} pointer moved backwards or diverged (${old} -> ${new}, status=${status})。意図したロールバックの場合はコミットメッセージに [rollback] を含めて再度 PR を作成してください。詳細は doc/release.md を参照してください" >&2
+                    echo "::error::${name} pointer moved backwards or diverged (${old} -> ${new}, status=${status})。意図したロールバックの場合はコミットメッセージに [rollback] を含めて再度 PR を作成してください。詳細は doc/release.md を参照してください"
                     exit 1
                   fi
                   ;;

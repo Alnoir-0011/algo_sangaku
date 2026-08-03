@@ -23,7 +23,8 @@ front/back それぞれで通常通り開発・レビュー・マージ（各リ
 ## 前提条件
 
 - 親リポジトリの Environment `deploy-dispatch`（Deployment branch policy: `main` 限定）に、Secrets `DEPLOY_DISPATCH_TOKEN`（back/front 双方への `workflow_dispatch` を起動できる fine-grained PAT）が登録済みであること。repository secret ではなく environment secret にすることで、`main` 以外のブランチのワークフローから読めないようにしている
-- back/front それぞれの GitHub Environment（back: `production` / front: `production`）に Required reviewer と Deployment branch policy（`main` 限定）が設定されており、承認できるメンバーであること
+- back/front それぞれの GitHub Environment（back: `production` / front: `Production`）に Required reviewer と Deployment branch policy（`main` 限定）が設定されており、承認できるメンバーであること
+  - Environment 名の表記が両者で異なるが、GitHub は Environment 名の大文字小文字を区別しないため、front の `deploy.yml` の `environment: production` は `Production` にマッチする（実行実績あり）
 - back の Environment に ECS/ECR 関連 secrets（`AWS_OIDC_ROLE_ARN`、`ECR_RAILS_URL`、`ECR_NGINX_URL`、`ECS_CLUSTER_NAME`、`ECS_SERVICE_NAME`、`ECS_TASK_FAMILY` 等）が登録済みであること
 - front の Environment に `VERCEL_ORG_ID` / `VERCEL_PROJECT_ID` / `VERCEL_TOKEN` が登録済みであること（未登録だと dispatch 自体は成功するが front 側のジョブが必ず失敗する）
 
@@ -39,7 +40,7 @@ front/back それぞれで通常通り開発・レビュー・マージ（各リ
    ```bash
    cd ..
    git checkout main && git pull
-   git checkout -b release/YYYY-MM-DD   # 親リポでもブランチを切る
+   git checkout -b release/YYYY-MM-DD   # submodule ポインタは親リポ自身の変更なので、親リポでブランチを切る
    git submodule status                  # detached/dirty なサブモジュールがないか確認
    git add back front                    # 更新があった方だけでも可
    git diff --cached --submodule=log     # 各ポインタが「進んでいる」ことを目視確認（巻き戻しがないか）
@@ -55,6 +56,7 @@ front/back それぞれで通常通り開発・レビュー・マージ（各リ
 6. dispatch されたリポジトリの Actions タブを開き、起動されたワークフロー（back: `ECS deploy` / front: `Deploy`）を確認する
    - `environment: production` の承認待ち状態になっているので、Required reviewer が承認する
    - 親リポの `deploy.yml` は commit 単位で concurrency を分離している（`group: deploy-sync-${{ github.sha }}`）。短時間に連続してマージすると複数の run が同時に dispatch されうるため、承認待ちの run が複数並んでいる場合は対象の SHA が今回リリースしたい commit と一致しているか確認してから承認すること
+   - **承認待ちの run を放置しないこと**。back/front 側のワークフローは `concurrency: deploy-production`（`cancel-in-progress: false`）のため、承認待ちの run がキューを占有し続ける。承認も却下もしないまま次のリリースを dispatch すると、後続の run は実行されずキューで待ち続ける。リリースを見送る場合は該当の run を Actions 画面から明示的にキャンセルすること
 7. 承認後、デプロイが完了するまで進捗を確認する
    - back: ECS サービスが安定化（`deployments` が1件、`rolloutState` が `COMPLETED`、かつ新しいタスク定義に一致）するまで最大20分ポーリングされる。`rolloutState` が `FAILED`（circuit breaker によるロールバックの可能性が高い）になった場合は即座に失敗する。それ以外の失敗はタイムアウトでジョブが赤くなる
    - front: `vercel build --prod` → `vercel deploy --prebuilt --prod` 後、ヘルスチェック（`curl` によるデプロイ先URLへのリクエスト）が実行される。失敗時はジョブが赤くなり、コミットステータス（`deploy/vercel-production`）も `failure` になる
@@ -69,7 +71,16 @@ front/back それぞれで通常通り開発・レビュー・マージ（各リ
 - 含まれる → `::warning::` を出して続行し、通常どおり dispatch する
 - 含まれない → `::error::` を出して失敗し、dispatch しない（意図しないダウングレードを止める fail-closed 設計）
 
-そのため、以下の一括ロールバック・片方だけのロールバックのいずれでも、コミットメッセージに必ず `[rollback]` を含めること。squash マージ・マージコミットのどちらでマージしても、ブランチ側のコミットのいずれかにマーカーが含まれていれば検出される（push イベントのコミット範囲全体が検査対象のため）。
+そのため、以下の一括ロールバック・片方だけのロールバックのいずれでも、コミットメッセージに必ず `[rollback]` を含めること。マージコミット・rebase マージの場合は、ブランチ側のコミットがそのまま `main` の履歴に入るため確実に検出される（push イベントのコミット範囲全体が検査対象のため）。
+
+**squash マージの場合はリポジトリ設定に依存する**点に注意。現在の親リポジトリは `squash_merge_commit_message: COMMIT_MESSAGES`（squash コミットの本文にブランチ側の各コミットメッセージを引き継ぐ）に設定されているため検出できるが、この設定を `PR_BODY` や `BLANK` に変更すると `[rollback]` が squash コミットに残らず、**マーカーが失われて後退検知で止まる**。設定を確認するには次を実行する。
+
+```bash
+gh api repos/Alnoir-0011/algo_sangaku --jq '{squash_title:.squash_merge_commit_title, squash_msg:.squash_merge_commit_message}'
+# => squash_msg が "COMMIT_MESSAGES" であること
+```
+
+確実を期すなら、ロールバック PR は squash ではなくマージコミットでマージするか、PR タイトル自体に `[rollback]` を含めるとよい（`squash_merge_commit_title` は `COMMIT_OR_PR_TITLE` のため、タイトルは squash コミットの1行目に必ず入る）。
 
 マーカーを付け忘れたまま `main` へマージしてしまうと、submodule ポインタ自体は更新されるが親リポの `deploy.yml` が `::error::` で失敗し、dispatch は行われない（実デプロイは走らない）。リカバリ方法は次のとおり。
 
