@@ -6,67 +6,42 @@ when_to_use: back/ または front/ で新しい issue ブランチの作業場�
 
 # Algo Sangaku — Worktree セットアップ
 
-## 前提：正しい起動場所
+## 前提：親リポジトリから起動したセッションで使う
 
-**このスキルは `back/` または `front/` 内から Claude を起動したセッションで呼び出す。**
+**このスキルは親リポジトリ（`algo_sangaku/`）から起動した Claude セッションで呼び出す。**
 
-`EnterWorktree` は「現在の git リポジトリの worktree 一覧にあるパス」しか受け付けない。
-親リポジトリ（`algo_sangaku/`）から起動すると、サブモジュールの worktree が一覧に出ないため切り替えができない
-（issue #27201、公式に "not planned" としてクローズ済み）。
+スキル定義が親リポの `.claude/skills/` にあるため、`back/`・`front/` から起動したセッションには
+読み込まれず、`/worktree` 自体が存在しない。
 
-### 推奨する起動コマンド（tmux 新規ウィンドウで）
+`EnterWorktree` は submodule（nested repository）に登録された worktree パスも受け付けるため、
+親リポセッションのまま back/front の worktree に切り替えられる。
+親リポの `git worktree list` に submodule の worktree が出ないことは正常で、それでも受理される。
 
-```bash
-# back で作業する場合
-cd /Users/taiki/workspace/runteq/algo_sangaku/back && claude
+### 制約
 
-# front で作業する場合
-cd /Users/taiki/workspace/runteq/algo_sangaku/front && claude
-```
+すでに別の worktree に入っているセッションからは使えない。
+`EnterWorktree` が nested repository のパスを受理するのは、起動ディレクトリからの**初回入場時のみ**。
+その場合はセッションを開き直してから実行する。
 
 ---
 
 ## 手順
 
-### Step 1: 起動場所の確認
-
-```bash
-git rev-parse --show-toplevel
-```
-
-- `*/back` または `*/front` で終わる → **そのまま続行**
-- `*/algo_sangaku` で終わる（親リポジトリ）→ **以下のエラーを表示して停止する**
-
-```
-⚠️  このスキルは back/ または front/ 内から起動した Claude セッションで使用してください。
-
-このセッションを終了して、以下のように再起動してください：
-
-  # back で作業する場合
-  cd /Users/taiki/workspace/runteq/algo_sangaku/back && claude
-
-  # front で作業する場合
-  cd /Users/taiki/workspace/runteq/algo_sangaku/front && claude
-
-再起動後に /worktree を再度実行してください。
-```
-
-### Step 2: ユーザーに確認
+### Step 1: ユーザーに確認
 
 AskUserQuestion で以下を1回で確認する：
 
-1. **Issue 番号**（数字のみ、例: `105`）
-2. **ブランチ名の suffix**（スラッグ形式、例: `add-user-search`）
+1. **対象サブモジュール**（`back` / `front`）
+2. **Issue 番号**（数字のみ、例: `105`）
+3. **ブランチ名の suffix**（スラッグ形式、例: `add-user-search`）
    → ブランチ名は `feature/issue-<番号>-<suffix>` になる
 
-サブモジュールは Step 1 で特定済みなので聞かない。
-
-### Step 3: Worktree の作成
+### Step 2: Worktree の作成
 
 ```bash
-# 現在のサブモジュールルートを取得
-SUBMODULE_ROOT=$(git rev-parse --show-toplevel)
-TARGET=$(basename "$SUBMODULE_ROOT")   # "back" または "front"
+REPO_ROOT=$(git rev-parse --show-toplevel)   # 親リポ algo_sangaku/
+TARGET="back"                                # Step 1 で選ばれた back または front
+SUBMODULE_ROOT="${REPO_ROOT}/${TARGET}"
 
 ISSUE_NUM="105"
 SUFFIX="add-user-search"
@@ -78,11 +53,12 @@ WORKTREE_PATH="${SUBMODULE_ROOT}/.worktrees/${WORKTREE_NAME}"
 grep -q "^\.worktrees" "${SUBMODULE_ROOT}/.gitignore" \
   || echo ".worktrees/" >> "${SUBMODULE_ROOT}/.gitignore"
 
-# worktree を作成
-git worktree add ".worktrees/${WORKTREE_NAME}" -b "${BRANCH}"
+# worktree を作成する。git worktree add は必ずサブモジュール内で実行する
+# （親リポで実行すると親リポの worktree になってしまう）
+cd "${SUBMODULE_ROOT}" && git worktree add ".worktrees/${WORKTREE_NAME}" -b "${BRANCH}"
 ```
 
-### Step 4: サブモジュール別の追加セットアップ
+### Step 3: サブモジュール別の追加セットアップ
 
 #### front の場合のみ
 
@@ -104,10 +80,11 @@ docker-compose -f "${SUBMODULE_ROOT}/compose.yaml" exec web \
   bash -c "cd .worktrees/${WORKTREE_NAME} && bundle exec rspec"
 ```
 
-### Step 5: セッションを worktree に切り替える
+### Step 4: セッションを worktree に切り替える
 
 ```bash
-git worktree list  # WORKTREE_PATH がリストに出ることを確認
+# 確認はサブモジュール内で行う（親リポの一覧には出ない）
+cd "${SUBMODULE_ROOT}" && git worktree list
 ```
 
 `EnterWorktree(path: "${WORKTREE_PATH}")` を呼んでセッションを worktree に切り替える。
@@ -146,7 +123,9 @@ git branch -d feature/issue-105-add-user-search
 
 | 問題 | 原因 | 対処 |
 |---|---|---|
-| Step 1 で親リポジトリと判定される | `algo_sangaku/` から claude を起動している | `back/` または `front/` 内から再起動する |
+| `/worktree` が一覧に出ない | `back/` または `front/` から claude を起動している（スキル定義は親リポにある） | 親リポ `algo_sangaku/` から起動し直す |
+| `EnterWorktree` がパスを拒否する | すでに別の worktree に入っているセッションから呼んでいる | セッションを開き直してから実行する |
+| 親リポの `git worktree list` に出ない | submodule の worktree は親リポの一覧には出ない（正常な挙動） | 確認は `back/`・`front/` 内で行う |
 | Docker でファイルが見えない | worktree が `back/` 外にある | `back/.worktrees/` 内に配置し直す |
 | `pnpm install` を忘れた | front の worktree は node_modules を共有しない | worktree 内で `pnpm install` を実行 |
 | worktree 内で main にコミットしてしまった | ブランチ確認を省略した | 作業前に `git branch` で確認する |
