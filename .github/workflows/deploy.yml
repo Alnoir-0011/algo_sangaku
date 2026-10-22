@@ -100,12 +100,24 @@ jobs:
             fi
           fi
 
+          # 検証失敗でその場で exit 1 すると、後続の側が検証されず、修正 PR の
+          # 差分には検証に失敗した側の変更しか現れないため、もう一方が取り残
+          # される。通った側を自動で dispatch しないのは、対にした変更を片方
+          # だけ本番に出さないため。
+          # GITHUB_OUTPUT は全側の検証後にまとめて書く。失敗した run に通った
+          # 側の出力が残ると、dispatch-* の if に always() などが付いたときに
+          # 片方だけ本番に出てしまう。
+          VALIDATION_FAILED=false
+          VERIFIED_SIDES=""
+          PENDING_OUTPUTS=""
+
           detect_one() {
-            local name="$1" repo="$2" new old status main_status
+            local name="$1" repo="$2" workflow="$3" new old status main_status
 
             new=$(git rev-parse "HEAD:$name")
             # 上記の ROLLBACK_ALLOWED 判定と同じ理由でパイプを使わない（here-string で渡す）
             if ! grep -Eq '^[0-9a-f]{40}$' <<<"$new"; then
+              # 壊れた状態で、検証を通った側の案内を出す根拠にならないため、後回しにせずその場で止める
               echo "::error::invalid gitlink sha for $name"
               exit 1
             fi
@@ -116,8 +128,7 @@ jobs:
             fi
 
             if [ "$old" = "$new" ]; then
-              echo "${name}=false" >> "$GITHUB_OUTPUT"
-              echo "${name}_sha=$new" >> "$GITHUB_OUTPUT"
+              PENDING_OUTPUTS+="${name}=false"$'\n'"${name}_sha=${new}"$'\n'
               return
             fi
 
@@ -132,20 +143,23 @@ jobs:
             # しない。
             main_status=$(gh api "repos/${repo}/compare/main...${new}" --jq '.status') || {
               echo "::error::gh api call failed: repos/${repo}/compare/main...${new}"
-              exit 1
+              VALIDATION_FAILED=true
+              return
             }
             case "$main_status" in
               identical|behind) ;;
               *)
                 echo "::error::${name} new sha (${new}) is not reachable from ${repo}#main (main...new status=${main_status})"
-                exit 1
+                VALIDATION_FAILED=true
+                return
                 ;;
             esac
 
             if [ -n "$old" ]; then
               status=$(gh api "repos/${repo}/compare/${old}...${new}" --jq '.status') || {
                 echo "::error::gh api call failed: repos/${repo}/compare/${old}...${new}"
-                exit 1
+                VALIDATION_FAILED=true
+                return
               }
               case "$status" in
                 behind|diverged)
@@ -153,18 +167,41 @@ jobs:
                     echo "::warning::${name} pointer moved backwards or diverged (${old} -> ${new}, status=${status})。commit メッセージに [rollback] が含まれているため、ロールバックとして続行します"
                   else
                     echo "::error::${name} pointer moved backwards or diverged (${old} -> ${new}, status=${status})。意図したロールバックの場合はコミットメッセージに [rollback] を含めて再度 PR を作成してください。詳細は doc/release.md を参照してください"
-                    exit 1
+                    VALIDATION_FAILED=true
+                    return
                   fi
                   ;;
               esac
             fi
 
-            echo "${name}=true" >> "$GITHUB_OUTPUT"
-            echo "${name}_sha=$new" >> "$GITHUB_OUTPUT"
+            PENDING_OUTPUTS+="${name}=true"$'\n'"${name}_sha=${new}"$'\n'
+            VERIFIED_SIDES+="${name} ${repo} ${workflow} ${new}"$'\n'
           }
 
-          detect_one back  Alnoir-0011/algo_sangaku_back
-          detect_one front Alnoir-0011/algo_sangaku_front
+          detect_one back  Alnoir-0011/algo_sangaku_back  autodeploy.yml
+          detect_one front Alnoir-0011/algo_sangaku_front deploy.yml
+
+          if [ "$VALIDATION_FAILED" = "true" ]; then
+            if [ -n "$VERIFIED_SIDES" ]; then
+              {
+                echo "### デプロイ同期: 検証に失敗したため dispatch していません"
+                echo "親リポジトリのコミットを変えずに直せる場合（gh api の一時的な失敗など）は、この run を Re-run してください。"
+                echo "修正 PR が要る場合は、マージした後に、検証を通った側を次のコマンドで直接起動できます。親リポジトリの main のポインタが同じ SHA でなければ、コマンドは実行されません。"
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+            while read -r name repo workflow sha; do
+              [ -n "$name" ] || continue
+              recovery_cmd="test \"\$(gh api 'repos/${GITHUB_REPOSITORY}/contents/${name}?ref=main' --jq .sha)\" = ${sha} && gh workflow run ${workflow} --repo ${repo} --ref main -f sha=${sha}"
+              echo "::error::${name} は検証を通りましたが、もう一方の検証失敗により dispatch されません。親リポジトリのコミットを変えずに直せる場合（gh api の一時的な失敗など）は、この run を Re-run してください。修正 PR が要る場合は、マージした後に次のコマンドを実行してください（親リポジトリの main の ${name} のポインタが ${sha} でなければ実行されません）: ${recovery_cmd}"
+              {
+                echo "- ${name} (sha=${sha})"
+                printf '%s\n' '```' "$recovery_cmd" '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+            done <<<"$VERIFIED_SIDES"
+            exit 1
+          fi
+
+          printf '%s' "$PENDING_OUTPUTS" >> "$GITHUB_OUTPUT"
 
       - name: No submodule changes
         if: steps.detect.outputs.back == 'false' && steps.detect.outputs.front == 'false'

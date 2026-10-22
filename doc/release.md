@@ -137,9 +137,38 @@ gh pr create --title "Rollback: back のみ直前バージョンに戻す" --bod
 | front のヘルスチェックが失敗する | Vercel 側のビルド・デプロイは成功したがアプリが起動していない、環境変数不足 | Vercel ダッシュボードでデプロイログを確認する。必要ならロールバック手順を実施する |
 | 指定した SHA が ancestor チェックで弾かれる（front: 「is not an ancestor of main」／back: 「は origin/main の履歴に含まれていません」。メッセージ文言はリポジトリにより異なる） | fork 由来の未マージコミットや、まだ push されていないローカルコミットの SHA を指定した | `main` に実際にマージされたコミットの SHA を指定し直す |
 | front で「required check '...' is missing or not successful」エラーになる | 対象 SHA の必須チェック（build / lint / componentstest / coverage / e2etest chromium・firefox・webkit）のいずれかが最新実行で success になっていない（実行中・check-runs が0件の場合も含む） | 対象コミットの CI が完了し全て成功していることを確認してから再実行する（back 側にはこの検証はない点に注意） |
-| 親リポの `deploy.yml` が「pointer moved backwards or diverged」で失敗する | ロールバック用コミットのメッセージに `[rollback]` が含まれていない。または `git submodule update` 忘れ・detached HEAD の取り違え等による意図しない後退 | コミットメッセージを確認する。ロールバックが目的なら `[rollback]` を含むコミットを作り直す（上記「ロールバック手順」参照）。意図しない後退なら PR を修正して正しいポインタに直す。back/front どちらか一方の検証失敗でも `detect` ジョブ全体が失敗し、もう一方に変更があっても dispatch されない点に注意 |
-| 親リポの `deploy.yml` が「is not reachable from ...#main」で失敗する | submodule 側で未 push のローカルコミットや、fork 由来の未マージコミットを指すポインタを親リポにコミットしてしまった | submodule を対象リポジトリの `main` 上に実在するコミットへ checkout し直してから、親リポ側のコミットをやり直す |
-| dispatch には成功したがそのまま放置され、後から同じ SHA で再 dispatch したい | Required reviewer の承認忘れ、対象リポのワークフローが誤ってキャンセルされた等 | (a) 親リポの `deploy.yml` の該当 run を Actions 画面から「Re-run all jobs」する（同じ before/after で再実行され、変更がなかった側は再びスキップされる）。(b) もしくは対象リポで直接 `gh workflow run <ファイル名> --repo <repo> --ref main -f sha=<sha>` を手動実行する |
+| 親リポの `deploy.yml` が「pointer moved backwards or diverged」で失敗する | ロールバック用コミットのメッセージに `[rollback]` が含まれていない。または `git submodule update` 忘れ・detached HEAD の取り違え等による意図しない後退 | コミットメッセージを確認する。ロールバックが目的なら、この時点でマージ済みで、親リポにコミットを足しても gitlink が変わらず dispatch されない。「ロールバック手順」のリカバリ方法にある「マージ後に気づいた場合」に従って、対象リポを直接起動する。意図しない後退なら PR を修正して正しいポインタに直し、修正 PR をマージした後で、下記「片方の検証失敗後の復旧」に従ってもう一方の側を出し直す。back/front どちらか一方の検証失敗でも `detect` ジョブ全体が失敗し、もう一方に変更があっても dispatch されない点に注意 |
+| 親リポの `deploy.yml` が「is not reachable from ...#main」で失敗する | submodule 側で未 push のローカルコミットや、fork 由来の未マージコミットを指すポインタを親リポにコミットしてしまった | submodule を対象リポジトリの `main` 上に実在するコミットへ checkout し直してから、親リポ側のコミットをやり直す。修正 PR をマージした後は、下記「片方の検証失敗後の復旧」に従って、検証を通った側を出し直す |
+| dispatch には成功したがそのまま放置され、後から同じ SHA で再 dispatch したい | Required reviewer の承認忘れ、対象リポのワークフローが誤ってキャンセルされた等 | (a) 親リポの `deploy.yml` の該当 run を Actions 画面から「Re-run all jobs」する（同じ before/after で再実行され、変更がなかった側は再びスキップされると想定される。before が同じになるかは未確認で、Re-run の前提は下記「片方の検証失敗後の復旧」を参照）。(b) もしくは対象リポで直接 `gh workflow run <ファイル名> --repo <repo> --ref main -f sha=<sha>` を手動実行する |
+
+### 片方の検証失敗後の復旧
+
+親リポの `deploy.yml` は back と front の両方を検証してから失敗する。片方が検証に失敗すると、もう一方が検証を通っていても dispatch されない。失敗した run の `::error::` と Summary には、検証を通った側の名前・SHA と直接起動のコマンドが出る。ただし、SHA の形式が不正（`invalid gitlink sha`）な場合は、その場で失敗するので案内は出ない。
+
+`detect` は `github.event.before` と push 後のコミットの差分で変更を検知する。修正 PR（ポインタを直す PR）をマージしても、検証を通っていた側のポインタは `before` に既に含まれているため、差分に現れず dispatch されない。復旧の方法は、親リポのコミットを変えずに済むかどうかで分かれる。
+
+- **親リポのコミットを変えずに原因を取り除ける場合**（例: 子リポに push し忘れていた、`gh api` の一時的な失敗）: 必要なら子リポで push（マージ）してから、失敗した run を Re-run する。次の条件を満たすこと。
+  - その SHA 自体が子リポの `main` に入ること（fast-forward か、マージコミットでのマージ）。squash と rebase のマージは SHA が変わるので、Re-run しても失敗する
+  - 失敗した run の後に、back と front のどちらのポインタも動いていないこと。Re-run は元のコミットで動くので、どちらかが進んでいると、古い SHA が dispatch される
+  - 失敗した run から 30 日以内であること
+  - 未確認: Re-run で `github.event.before` が元の値のままになるかは、公式ドキュメントに明記がなく、このリポジトリでの実績もない。結果が合わない場合は、次の方法を使う
+- **親リポにポインタの付け直しなどの修正コミットが要る場合**: 修正 PR をマージした後に、失敗した run の `::error::` に出たコマンドを実行する。コマンドには、親リポの `main` のポインタが同じ SHA であることの確認が含まれ、ポインタが進んでいれば何も実行されない。
+
+  ```bash
+  test "$(gh api 'repos/<親リポ>/contents/<back|front>?ref=main' --jq .sha)" = <エラーに出た SHA> \
+    && gh workflow run <ファイル名> --repo <repo> --ref main -f sha=<エラーに出た SHA>
+  ```
+
+  手元でポインタを確認するときは `git fetch origin && git rev-parse origin/main:back origin/main:front` を使う。直接起動は親リポの `deploy.yml` を通らないため、後退・分岐の検証は行われない（子リポ側の `main` の祖先チェックは行われる）。
+
+修正 PR の run も、検証で落ちることがある。修正 PR の `before` には修正前の不正なポインタ（`old`）が含まれ、`old...new` の compare が走るためである。
+
+- `old` が子リポに存在しない SHA（push していないローカルコミットなど）だと、compare が 404 になり、`gh api call failed` で失敗する（確認済み）
+- `old` が `main` に未マージの実在コミットだと、`diverged` になり、`[rollback]` が無ければ失敗する（確認済み）。fork 由来の SHA が compare で解決されるかは未確認
+- どちらも修正した側は dispatch されないので、その SHA が子リポの `main` に入っていることを確認したうえで、上と同じ形で直接起動する
+- `[rollback]` を付けて通す場合、その push のコミット範囲全体で後退・分岐の検証が無効になる。同じ PR でもう一方のポインタを動かさない
+
+`[rollback]` の付け忘れは、親リポにコミットを足しても直せない。「ロールバック手順」のリカバリ方法にある「マージ後に気づいた場合」に従う。
 
 ## 緊急連絡フロー
 
